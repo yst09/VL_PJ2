@@ -17,30 +17,52 @@ class LineCounter:
         self.count_left = 0
         self.count_right = 0
         self.tracked_objects = {}
+        self.frame_counter = 0
+        self.cleanup_interval = 300  # 每300帧清理一次未活跃的ID
 
     def update(self, xyxy, ids, frame_width):
         """更新计数逻辑 (基于 X 轴坐标)"""
         line_x = int(frame_width * self.line_x_ratio)
+        self.frame_counter += 1
+        current_ids = set()
 
         for box, track_id in zip(xyxy, ids):
-            # 计算检测框中心点的 X 坐标
+            current_ids.add(track_id)
             current_x = (box[0] + box[2]) / 2
 
             if track_id in self.tracked_objects:
-                prev_x = self.tracked_objects[track_id]['last_x']
+                obj = self.tracked_objects[track_id]
+                prev_x = obj['last_x']
 
-                # 从左往右跨越 (上一帧在左，这一帧在右)
-                if prev_x < line_x and current_x >= line_x:
+                # 已计数标志：避免同一 ID 在线附近抖动反复计数
+                if not obj.get('counted_right', False) and prev_x < line_x and current_x >= line_x:
                     self.count_right += 1
+                    obj['counted_right'] = True
+                    obj['counted_left'] = False
                     print(f'>> Object {track_id} crossed line to RIGHT. Total Right: {self.count_right}')
 
-                # 从右往左跨越 (上一帧在右，这一帧在左)
-                elif prev_x > line_x and current_x <= line_x:
+                elif not obj.get('counted_left', False) and prev_x > line_x and current_x <= line_x:
                     self.count_left += 1
+                    obj['counted_left'] = True
+                    obj['counted_right'] = False
                     print(f'<< Object {track_id} crossed line to LEFT. Total Left: {self.count_left}')
 
-            # 更新物体的历史位置
-            self.tracked_objects[track_id] = {'last_x': current_x}
+                obj['last_x'] = current_x
+                obj['last_seen'] = self.frame_counter
+            else:
+                self.tracked_objects[track_id] = {
+                    'last_x': current_x,
+                    'last_seen': self.frame_counter,
+                    'counted_left': False,
+                    'counted_right': False,
+                }
+
+        # 定期清理长时间未出现的 ID，防止字典无限增长
+        if self.frame_counter % self.cleanup_interval == 0:
+            stale = [tid for tid, obj in self.tracked_objects.items()
+                     if self.frame_counter - obj['last_seen'] > self.cleanup_interval]
+            for tid in stale:
+                del self.tracked_objects[tid]
 
     def get_counts(self):
         return {'left': self.count_left, 'right': self.count_right}
@@ -75,7 +97,8 @@ def detect_occlusion(xyxy, ids, occlusion_threshold=0.6):
                     
     return occlusion_events
 
-def process_video(source, model_path, line_x=0.5, save_occlusion=False, output_dir='./output'):
+def process_video(source, model_path, line_x=0.5, save_occlusion=False, output_dir='./output',
+                  classes=None, conf=0.4, iou=0.5, imgsz=640, tracker='botsort.yaml'):
     os.makedirs(output_dir, exist_ok=True)
     print(f'Loading model from {model_path}')
     model = YOLO(model_path)
@@ -87,7 +110,9 @@ def process_video(source, model_path, line_x=0.5, save_occlusion=False, output_d
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -110,49 +135,49 @@ def process_video(source, model_path, line_x=0.5, save_occlusion=False, output_d
         if frame_idx % 30 == 0:
             print(f'Processing frame {frame_idx}/{total_frames}')
 
-        # 核心改动：直接调用 YOLO 的 .track() 并使用 BoT-SORT
-        # persist=True 告诉模型保留上一帧的轨迹历史
-        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)[0]
+        # 保存原始帧用于遮挡帧保存（避免保存到带标注的图）
+        raw_frame = frame.copy() if save_occlusion else None
+
+        # 显式传入 imgsz / conf / iou / classes，避免推理与训练设置不一致或检出无关类别
+        results = model.track(
+            frame,
+            persist=True,
+            tracker=tracker,
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou,
+            classes=classes,
+            verbose=False,
+        )[0]
         boxes = results.boxes
 
-        # 确保当前帧检测到了物体，并且成功分配了 tracking ID
         if boxes is not None and boxes.id is not None:
-            # 强制转换为 int 类型，彻底消灭小数 ID
             xyxy = boxes.xyxy.cpu().numpy()
             ids = boxes.id.int().cpu().tolist()
             clss = boxes.cls.int().cpu().tolist()
             confs = boxes.conf.cpu().numpy()
 
-            # 绘制检测框与整数 ID
-            for box, track_id, cls, conf in zip(xyxy, ids, clss, confs):
+            for box, track_id, cls, cf in zip(xyxy, ids, clss, confs):
                 x1, y1, x2, y2 = map(int, box)
-                label = f'ID:{track_id} {results.names[cls]} {conf:.2f}'
-                
-                # 画框
+                label = f'ID:{track_id} {results.names[cls]} {cf:.2f}'
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                # 写标签
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # 更新左右越线计数器
             counter.update(xyxy, ids, width)
 
-            # 检测遮挡并保存
             if save_occlusion:
                 occlusions = detect_occlusion(xyxy, ids)
                 if occlusions:
                     occlusion_frame_path = os.path.join(occlusion_dir, f'frame_{frame_idx:06d}.jpg')
-                    cv2.imwrite(occlusion_frame_path, frame)
+                    cv2.imwrite(occlusion_frame_path, raw_frame)
                     print(f'[*] Occlusion detected at frame {frame_idx} between IDs: {occlusions}')
 
-        # 绘制垂直参考线
         line_x_px = int(width * line_x)
         cv2.line(frame, (line_x_px, 0), (line_x_px, height), (0, 0, 255), 3)
 
-        # 绘制统计面板
         counts = counter.get_counts()
         info_text = f'Moving Left: {counts["left"]} | Moving Right: {counts["right"]}'
-        
-        # 增加一个黑底背景让文字更清晰
+
         cv2.rectangle(frame, (10, 10), (600, 60), (0, 0, 0), -1)
         cv2.putText(frame, info_text, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
@@ -160,7 +185,8 @@ def process_video(source, model_path, line_x=0.5, save_occlusion=False, output_d
 
     cap.release()
     out.release()
-    print(f'\nFinal counts: Left={counts["left"]}, Right={counts["right"]}')
+    final_counts = counter.get_counts()
+    print(f'\nFinal counts: Left={final_counts["left"]}, Right={final_counts["right"]}')
     print(f'Output video saved to {output_dir}/output_tracked.mp4')
 
 def main():
@@ -170,6 +196,13 @@ def main():
     parser.add_argument('--line_x', type=float, default=0.5, help='越线X轴位置比例 (0.0-1.0)')
     parser.add_argument('--save_occlusion', action='store_true', help='保存发生遮挡的帧')
     parser.add_argument('--output_dir', type=str, default='./output', help='输出目录')
+    parser.add_argument('--classes', type=int, nargs='+', default=None,
+                        help='只跟踪指定类别 ID (COCO 车辆: 2 3 5 7 = car motorcycle bus truck)')
+    parser.add_argument('--conf', type=float, default=0.4, help='检测置信度阈值')
+    parser.add_argument('--iou', type=float, default=0.5, help='NMS IoU 阈值')
+    parser.add_argument('--imgsz', type=int, default=640, help='推理图像尺寸 (应与训练一致)')
+    parser.add_argument('--tracker', type=str, default='botsort.yaml',
+                        help='跟踪器配置 (botsort.yaml / bytetrack.yaml)')
     args = parser.parse_args()
 
     process_video(
@@ -177,7 +210,12 @@ def main():
         model_path=args.model,
         line_x=args.line_x,
         save_occlusion=args.save_occlusion,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        classes=args.classes,
+        conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
+        tracker=args.tracker,
     )
 
 if __name__ == '__main__':
